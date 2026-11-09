@@ -1,0 +1,4 @@
+PP-OCRv6 Tiny model assets
+Package @rustors/model-ppocrv6-tiny 0.3.2
+https://www.npmjs.com/package/@rustors/model-ppocrv6-tiny/v/0.3.2
+https://github.com/byrizki/rusto-rs

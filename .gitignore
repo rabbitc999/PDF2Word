@@ -1,0 +1,5 @@
+/target/
+/vendor/pandoc.exe
+/vendor/pandoc.zip
+/vendor/unpack/
+.DS_Store

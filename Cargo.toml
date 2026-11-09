@@ -1,0 +1,51 @@
+[package]
+name = "pdf_to_word"
+version = "1.6.1"
+edition = "2024"
+publish = false
+default-run = "pdf_to_word"
+
+[features]
+default = ["embed-pandoc"]
+embed-pandoc = []
+
+[[bin]]
+name = "pdf_to_word"
+path = "src/pdf_to_word.rs"
+
+[[bin]]
+name = "pdf_to_word_gui"
+path = "src/pdf_to_word_gui.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+docx-rs = "0.4.22"
+image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png"] }
+pdf_oxide = { version = "0.3.78", features = ["rendering"] }
+png = "0.18"
+rusto-rs = { version = "=0.3.2", default-features = false }
+tempfile = "3"
+ttf-parser = "0.25"
+
+[build-dependencies]
+find-msvc-tools = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+strip = "symbols"
