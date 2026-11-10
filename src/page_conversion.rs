@@ -1,6 +1,10 @@
 //! 将 PDF 页上的文字、表格和图片转换为 Word 元素。
 
-use std::{borrow::Cow, collections::HashMap, io::Cursor};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    io::Cursor,
+};
 
 use anyhow::{Context, Result};
 use docx_rs::{
@@ -22,7 +26,11 @@ use pdf_oxide::{
     layout::{TextChar, TextSpan},
     outline::{Destination, OutlineItem},
     rendering::{RenderOptions, render_page},
-    structure::table_extractor::Table as PdfTable,
+    structure::{
+        McidScope, StructChild, StructElem, StructType, extract_table_from_spans_on_page,
+        find_table_elements_all_pages,
+        table_extractor::Table as PdfTable,
+    },
 };
 
 use crate::{
@@ -441,8 +449,82 @@ fn already_in_table(span: &TextSpan, table: &PdfTable) -> bool {
     };
     table.bbox.is_some_and(contains_center)
         && table.rows.iter().flat_map(|row| &row.cells).any(|cell| {
-            cell.bbox.is_some_and(contains_center) && cell.text.contains(span.text.trim())
+            cell.bbox.is_some_and(contains_center)
+                && (cell.text.contains(span.text.trim())
+                    || cell.spans.iter().any(|source| {
+                        source.mcid.is_some()
+                            && source.mcid == span.mcid
+                            && source.mcid_scope == span.mcid_scope
+                            && source.bbox == span.bbox
+                            && source.text == span.text
+                    }))
         })
+}
+
+/// 目前只在标签能完整表示普通网格时使用它。跨流引用或嵌套表格交给几何检测。
+fn supports_table_tags(element: &StructElem, page: u32) -> bool {
+    element.children.iter().all(|child| match child {
+        StructChild::StructElem(child) => {
+            child.struct_type != StructType::Table && supports_table_tags(child, page)
+        }
+        StructChild::MarkedContentRef {
+            page: source, scope, ..
+        } => *source != page || *scope == McidScope::Page(page),
+        StructChild::ObjectRef(..) => true,
+    })
+}
+
+/// 优先使用 PDF 的逻辑行列，按当前页的标记编号取回带样式的原始文字。
+fn tagged_tables(elements: &[StructElem], page: u32, spans: &[&TextSpan]) -> Vec<PdfTable> {
+    let mut by_mcid = HashMap::<u32, Vec<&TextSpan>>::new();
+    for &span in spans {
+        if let Some(mcid) = span.mcid
+            && (span.mcid_scope.is_none() || span.mcid_scope == Some(McidScope::Page(page)))
+        {
+            by_mcid.entry(mcid).or_default().push(span);
+        }
+    }
+    elements
+        .iter()
+        .filter(|element| supports_table_tags(element, page))
+        .filter_map(|element| {
+            // 只从标签取行列和编号，保留原始 span 的字体、颜色、位置和间距。
+            let mut table = extract_table_from_spans_on_page(element, &[], Some(page)).ok()?;
+            if table.col_count < 2
+                || table.rows.iter().any(|row| row.cells.len() != table.col_count)
+            {
+                return None;
+            }
+            let mut used = HashSet::new();
+            for row in &mut table.rows {
+                row.is_header |= !row.cells.is_empty() && row.cells.iter().all(|cell| cell.is_header);
+                for cell in &mut row.cells {
+                    cell.mcids.sort_unstable();
+                    cell.mcids.dedup();
+                    for mcid in &cell.mcids {
+                        if !used.insert(*mcid) {
+                            return None;
+                        }
+                        if let Some(sources) = by_mcid.get(mcid) {
+                            cell.spans.extend(sources.iter().map(|&span| span.clone()));
+                        }
+                    }
+                    if cell.spans.is_empty() && !cell.mcids.is_empty() {
+                        return None;
+                    }
+                    cell.text = cell.spans.iter().map(|span| span.text.as_str()).collect();
+                    cell.bbox = cell.spans.iter().map(|span| span.bbox).reduce(|a, b| a.union(&b));
+                }
+            }
+            table.bbox = table
+                .rows
+                .iter()
+                .flat_map(|row| &row.cells)
+                .filter_map(|cell| cell.bbox)
+                .reduce(|a, b| a.union(&b));
+            table.bbox.is_some().then_some(table)
+        })
+        .collect()
 }
 
 /// 将识别出的网格线颜色和线宽应用到 Word 表格的外框及内部边线。
@@ -1095,6 +1177,15 @@ pub(crate) fn build_document(
     } else {
         HashMap::new()
     };
+    let table_tags = if use_text_layer {
+        pdf.structure_tree()
+            .ok()
+            .flatten()
+            .map(|tree| find_table_elements_all_pages(&tree))
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
     let mut next_code_id = 1;
     let mut structure = WordStructure::default();
     let mut previous_tables = Vec::<(usize, Rect, Vec<String>)>::new();
@@ -1250,7 +1341,12 @@ pub(crate) fn build_document(
                 inline_pictures: &[],
                 code_chars: &[],
             };
-            let tables = pdf.extract_tables(page)?;
+            let tagged = tagged_tables(
+                table_tags.get(&(page as u32)).map_or(&[], Vec::as_slice),
+                page as u32,
+                &spans,
+            );
+            let spatial = pdf.extract_tables(page)?;
             let paths = pdf.extract_paths(page)?;
             let mut code_chars = if spans.iter().any(|span| is_code_font(span)) {
                 pdf.extract_chars(page).unwrap_or_default()
@@ -1260,8 +1356,20 @@ pub(crate) fn build_document(
             code_chars.retain(|ch| ch.origin_y.is_finite());
             code_chars.sort_by(|a, b| a.origin_y.total_cmp(&b.origin_y));
             let mut exported_tables = Vec::new();
-            for table in &tables {
+            let mut exported_tagged: Vec<(Rect, &PdfTable)> = Vec::new();
+            for (table, from_tags) in tagged
+                .iter()
+                .map(|table| (table, true))
+                .chain(spatial.iter().map(|table| (table, false)))
+            {
                 if let Some(bounds) = table.bbox {
+                    if !from_tags && exported_tagged.iter().any(|(tagged, _)| {
+                        tagged.intersection(&bounds).is_some_and(|overlap| {
+                            overlap.area() > tagged.area().min(bounds.area()) * 0.5
+                        })
+                    }) {
+                        continue;
+                    }
                     // 检测框通常以文字边缘为界，给末列补足单元格边距。
                     let table_width = (bounds.width + 24.0).clamp(24.0, content_width);
                     if let Some(word_table) = word_table(table, &style, table_width, &paths, bounds)
@@ -1298,6 +1406,9 @@ pub(crate) fn build_document(
                             ),
                         ));
                         exported_tables.push(table);
+                        if from_tags {
+                            exported_tagged.push((bounds, table));
+                        }
                     }
                 }
             }
@@ -1308,6 +1419,15 @@ pub(crate) fn build_document(
                 .collect();
             let mut vector_regions =
                 pdf_appearance::vector_regions(&paths, &table_regions, &spans, media);
+            // 表格裁图可能延伸至末列的空白，超出按文字计算的表格范围。
+            vector_regions.retain(|region| {
+                !exported_tagged.iter().any(|(bounds, table)| {
+                    bounds.intersects(region)
+                        && table.rows.iter().flat_map(|row| &row.cells).any(|cell| {
+                            cell.spans.iter().any(|span| region.contains_rect(&span.bbox))
+                        })
+                })
+            });
             let icon_regions: Vec<_> = spans
                 .iter()
                 .filter(|span| is_icon(span))
